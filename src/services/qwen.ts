@@ -180,7 +180,7 @@ export async function createQwenStream(
   const payload: QwenPayload = {
     stream: true,
     version: '2.1',
-    incremental_output: false,
+    incremental_output: true,
     chat_id: chatSessionId || null,
     chat_mode: 'normal',
     model: model,
@@ -234,7 +234,7 @@ export async function createQwenStream(
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
-      'timezone': new Date().toString().split(' (')[0], // Match closer to browser format
+      'timezone': new Date().toString().split(' (')[0], 
       'user-agent': headers['user-agent'],
       'x-accel-buffering': 'no',
       'x-request-id': uuidv4(),
@@ -247,7 +247,6 @@ export async function createQwenStream(
 
   if (!response.ok || !response.body) {
     const errText = await response.text().catch(() => '');
-    console.error(`[Qwen API Error] Status: ${response.status} - ${errText}`);
     throw new Error(`Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`);
   }
 
