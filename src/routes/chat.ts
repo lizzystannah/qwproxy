@@ -177,9 +177,7 @@ export async function chatCompletions(c: Context) {
       let fullReasoning = '';
       let buffer = '';
 
-      const toolParser = new StreamingToolParser();
       let lastAnswerContent = '';
-      
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -195,7 +193,6 @@ export async function chatCompletions(c: Context) {
             if (delta?.phase === 'answer' && delta.content !== undefined) {
               const vStr = getIncrementalDelta(lastAnswerContent, delta.content);
               if (vStr) {
-                toolParser.feed(vStr); // Feed to parser to catch tools
                 fullContent += vStr;
                 lastAnswerContent = delta.content;
               }
@@ -207,7 +204,10 @@ export async function chatCompletions(c: Context) {
         }
       }
 
-      const { text: cleanText, toolCalls } = toolParser.flush();
+      // Process the whole content at once for tools
+      const toolParser = new StreamingToolParser();
+      toolParser.feed(fullContent);
+      const { text: cleanText, toolCalls: callsFromFeed } = toolParser.flush();
       
       return c.json({
         id: completionId,
@@ -218,9 +218,9 @@ export async function chatCompletions(c: Context) {
           index: 0,
           message: {
             role: 'assistant',
-            content: cleanText || '',
+            content: cleanText || fullContent || '', // Fallback to fullContent if cleanText is empty for some reason
             reasoning_content: fullReasoning || undefined,
-            tool_calls: toolCalls.length > 0 ? toolCalls.map((tc, idx) => ({
+            tool_calls: callsFromFeed.length > 0 ? callsFromFeed.map((tc, idx) => ({
               id: tc.id,
               type: 'function',
               function: {
@@ -229,7 +229,7 @@ export async function chatCompletions(c: Context) {
               }
             })) : undefined
           },
-          finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
+          finish_reason: callsFromFeed.length > 0 ? 'tool_calls' : 'stop'
         }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       });
