@@ -180,7 +180,7 @@ export async function createQwenStream(
   const payload: QwenPayload = {
     stream: true,
     version: '2.1',
-    incremental_output: true,
+    incremental_output: false,
     chat_id: chatSessionId || null,
     chat_mode: 'normal',
     model: model,
