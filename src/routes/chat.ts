@@ -201,17 +201,27 @@ export async function chatCompletions(c: Context) {
           const trimmed = line.trim();
           if (!trimmed || !trimmed.startsWith('data: ') || trimmed.includes('[DONE]')) continue;
           try {
-            const chunk = JSON.parse(trimmed.slice(6));
+            const rawJson = trimmed.slice(6);
+            const chunk = JSON.parse(rawJson);
             const delta = chunk.choices?.[0]?.delta;
             
-            if (delta?.phase === 'answer' && delta.content) {
-              // In non-streaming, we always take the latest content which is the cumulative result
-              fullContent = delta.content;
+            if (delta) {
+              if (delta.phase === 'answer' && delta.content) {
+                // If the new content is longer than what we have, it's cumulative
+                if (delta.content.length > fullContent.length) {
+                  fullContent = delta.content;
+                } else if (!fullContent.includes(delta.content)) {
+                  // If it's a new piece that's not already there, append it (delta mode)
+                  fullContent += delta.content;
+                }
+              }
+              if (delta.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
+                fullReasoning = delta.extra.summary_thought.content.join('\n');
+              }
             }
-            if (delta?.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
-              fullReasoning = delta.extra.summary_thought.content.join('\n');
-            }
-          } catch (e) {}
+          } catch (e) {
+            console.error('[Parser Error] Failed to parse chunk:', trimmed);
+          }
         }
       }
 
