@@ -80,7 +80,16 @@ export async function chatCompletions(c: Context) {
           if ((msg as any).reasoning_content) {
             assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
           }
+          if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+             for (const tc of msg.tool_calls) {
+               let args = tc.function?.arguments || '{}';
+               if (typeof args !== 'string') args = JSON.stringify(args);
+               assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
+             }
+          }
           prompt += `Assistant: ${assistantContent.trim()}\n\n`;
+        } else if (msg.role === 'tool' || msg.role === 'function') {
+          prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
         }
       }
     }
@@ -266,7 +275,7 @@ export async function chatCompletions(c: Context) {
           index: 0,
           message: {
             role: 'assistant',
-            content: cleanText || fullContent || '', // Fallback to fullContent if cleanText is empty for some reason
+            content: callsFromFeed.length > 0 ? null : (cleanText || fullContent || ''),
             reasoning_content: fullReasoning || undefined,
             tool_calls: callsFromFeed.length > 0 ? callsFromFeed.map((tc, idx) => ({
               id: tc.id,
