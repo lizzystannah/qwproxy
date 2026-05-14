@@ -14,6 +14,7 @@ import { cors } from 'hono/cors';
 import { bearerAuth } from 'hono/bearer-auth';
 import { chatCompletions } from './routes/chat.ts';
 import { fetchQwenModels } from './services/qwen.ts';
+import { activePage } from './services/playwright.ts';
 import * as dotenv from 'dotenv';
 import { initPlaywright } from './services/playwright.ts';
 
@@ -38,6 +39,21 @@ app.use('/v1/*', async (c, next) => {
 
 // Basic health check
 app.get('/health', (c) => c.json({ status: 'ok' }));
+
+app.get('/debug/login', async (c) => {
+  if (!activePage) return c.json({ status: 'Playwright not initialized' });
+  
+  const url = activePage.url();
+  const content = await activePage.content();
+  const isLogged = content.includes('data-testid="chat-input-textarea"') || content.includes('qwen-logo') || !url.includes('auth');
+  
+  return c.json({
+    url: url,
+    is_logged_in: isLogged,
+    has_chat_input: content.includes('textarea') || content.includes('contenteditable'),
+    page_title: await activePage.title()
+  });
+});
 
 // OpenAI compatible routes
 app.get('/', (c) => c.text('QwenProxy is running! Use /v1/chat/completions for API.'));
