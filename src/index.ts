@@ -43,9 +43,15 @@ app.get('/health', (c) => c.json({ status: 'ok' }));
 app.get('/debug/login', async (c) => {
   if (!activePage) return c.json({ status: 'Playwright not initialized' });
   
-  const url = activePage.url();
+  let url = activePage.url();
+  if (url === 'about:blank') {
+    console.log('[Debug] Page is blank, navigating to Qwen...');
+    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
+    url = activePage.url();
+  }
+  
   const content = await activePage.content();
-  const isLogged = content.includes('data-testid="chat-input-textarea"') || content.includes('qwen-logo') || !url.includes('auth');
+  const isLogged = content.includes('data-testid="chat-input-textarea"') || content.includes('qwen-logo') || (!url.includes('auth') && url !== 'about:blank');
   
   return c.json({
     url: url,
