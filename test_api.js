@@ -1,7 +1,5 @@
-import fetch from 'node-fetch';
-
 const API_URL = 'https://quantterm-qwen.ikicmr.easypanel.host/v1/chat/completions';
-const API_KEY = 'SUA_CHAVE_AQUI'; // Coloque a chave que você definiu no Easypanel
+const API_KEY = 'SUA_CHAVE_AQUI'; // Lembre-se de trocar pela sua chave!
 
 async function test() {
   console.log('Enviando requisição para a API...');
