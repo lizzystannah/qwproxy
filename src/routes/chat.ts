@@ -269,7 +269,7 @@ export async function chatCompletions(c: Context) {
       const promptTokens = Math.ceil(finalPrompt.length / 4);
       const completionTokens = Math.ceil((cleanText || fullContent || '').length / 4);
 
-      return c.json({
+      const responseBody = {
         id: completionId,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
@@ -278,7 +278,7 @@ export async function chatCompletions(c: Context) {
           index: 0,
           message: {
             role: 'assistant',
-            content: callsFromFeed.length > 0 ? null : (cleanText || fullContent || ''),
+            content: (callsFromFeed.length > 0) ? "" : (cleanText || fullContent || ""),
             reasoning_content: fullReasoning || undefined,
             tool_calls: callsFromFeed.length > 0 ? callsFromFeed.map((tc, idx) => ({
               id: tc.id,
@@ -296,7 +296,10 @@ export async function chatCompletions(c: Context) {
           completion_tokens: completionTokens, 
           total_tokens: promptTokens + completionTokens 
         }
-      });
+      };
+
+      console.log(`[Response] ${completionId} | Content Length: ${responseBody.choices[0].message.content?.length || 0} | Tools: ${callsFromFeed.length}`);
+      return c.json(responseBody);
     }
   } catch (err: any) {
     console.error('Error in chatCompletions:', err);
