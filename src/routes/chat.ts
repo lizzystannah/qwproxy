@@ -101,6 +101,9 @@ export async function chatCompletions(c: Context) {
     const isThinkingModel = !body.model.includes('no-thinking');
     const isNewSession = !messages.some(m => m.role === 'assistant');
 
+    console.log(`[Qwen] Thinking Model: ${isThinkingModel} | New Session: ${isNewSession}`);
+    console.log(`[Prompt Preview] "${finalPrompt.substring(0, 200)}..."`);
+
     const result = await createQwenStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined);
     const stream = result.stream;
     const uiSessionId = result.uiSessionId;
@@ -139,10 +142,16 @@ export async function chatCompletions(c: Context) {
         let currentThoughtIndex = 0;
         let totalContentEmitted = '';
         let rawContentAccumulated = '';
+        let chunksReceived = 0;
+        let answerChunks = 0;
+        let thinkingChunks = 0;
 
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            console.log(`[Stream] Done. Chunks: ${chunksReceived} | Thinking: ${thinkingChunks} | Answer: ${answerChunks}`);
+            break;
+          }
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
@@ -156,26 +165,36 @@ export async function chatCompletions(c: Context) {
 
             try {
               const chunk = JSON.parse(dataStr);
+              chunksReceived++;
+              
               if (chunk.response_id) updateSessionParent(uiSessionId, chunk.response_id);
 
               if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
                 const delta = chunk.choices[0].delta;
                 
+                // ✅ LOG DETALHADO
+                console.log(`[Chunk #${chunksReceived}] Phase: ${delta.phase || 'none'} | Has Content: ${delta.content !== undefined} | Content Length: ${delta.content?.length || 0}`);
+                
                 if (delta.phase === 'thinking_summary') {
+                   thinkingChunks++;
                    if (delta.extra?.summary_thought?.content) {
                       const thoughts = delta.extra.summary_thought.content;
                       if (thoughts.length > currentThoughtIndex) {
                         currentThoughtIndex = thoughts.length;
+                        console.log(`[Thinking] Received ${thoughts.length - currentThoughtIndex} thoughts`);
                       }
                    }
                 } else if (delta.phase === 'answer') {
+                  answerChunks++;
+                  
                   if (delta.content !== undefined) {
                     const vStr = getIncrementalDelta(lastFullContent, delta.content);
+                    console.log(`[Answer Chunk] Delta: "${vStr.substring(0, 50)}${vStr.length > 50 ? '...' : ''}" (${vStr.length} chars)`);
+                    
                     if (vStr) {
                       lastFullContent += vStr;
                       rawContentAccumulated += vStr;
                       
-                      // ✅ Se houver tools, parsear. Senão, enviar direto
                       if (toolParser) {
                         const { text, toolCalls } = toolParser.feed(vStr);
                         
@@ -218,7 +237,6 @@ export async function chatCompletions(c: Context) {
                           });
                         }
                       } else {
-                        // ✅ SEM TOOLS: enviar conteúdo direto
                         totalContentEmitted += vStr;
                         await writeEvent({ 
                           id: completionId, 
@@ -229,11 +247,17 @@ export async function chatCompletions(c: Context) {
                         });
                       }
                     }
+                  } else {
+                    console.log(`[Answer Chunk] No content in delta`);
                   }
+                } else {
+                  console.log(`[Unknown Phase] ${delta.phase || 'undefined'}`);
                 }
+              } else {
+                console.log(`[Chunk #${chunksReceived}] No delta or choices`);
               }
             } catch (e) {
-              console.error('[Stream Parse Error]', e);
+              console.error('[Stream Parse Error]', e, 'Line:', trimmed.substring(0, 100));
             }
           }
         }
@@ -281,9 +305,10 @@ export async function chatCompletions(c: Context) {
             });
           }
           
-          const finalFinishReason = toolParser.getEmittedToolCallCount() > 0 ? 'tool_calls' : 'stop';
+          const totalToolCalls = toolParser.getEmittedToolCallCount();
+          const finalFinishReason = totalToolCalls > 0 ? 'tool_calls' : 'stop';
           
-          console.log(`[Stream Complete] Raw: "${rawContentAccumulated.substring(0, 100)}..." | Content: "${totalContentEmitted.substring(0, 100)}..." | Tools: ${toolParser.getEmittedToolCallCount()}`);
+          console.log(`[Stream Complete] Raw: ${rawContentAccumulated.length} chars | Emitted: ${totalContentEmitted.length} chars | Tools: ${totalToolCalls}`);
           
           await writeEvent({ 
             id: completionId, 
@@ -293,7 +318,7 @@ export async function chatCompletions(c: Context) {
             choices: [makeChoice({}, finalFinishReason)] 
           });
         } else {
-          console.log(`[Stream Complete - No Tools] Content: "${totalContentEmitted.substring(0, 100)}..." (${totalContentEmitted.length} chars)`);
+          console.log(`[Stream Complete - No Tools] Content: ${totalContentEmitted.length} chars`);
           
           await writeEvent({ 
             id: completionId, 
@@ -307,17 +332,26 @@ export async function chatCompletions(c: Context) {
         await streamWriter.write('data: [DONE]\n\n');
       });
     } else {
-      // ✅ NON-STREAMING
+      // ✅ NON-STREAMING com logs detalhados
       const reader = stream.getReader();
       const decoder = new TextDecoder();
       let fullContent = '';
       let fullReasoning = '';
       let buffer = '';
       let lastAnswerContent = '';
+      let chunksReceived = 0;
+      let answerChunks = 0;
+      let thinkingChunks = 0;
+
+      console.log(`[Non-Stream] Starting to read stream...`);
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          console.log(`[Non-Stream] Done. Chunks: ${chunksReceived} | Thinking: ${thinkingChunks} | Answer: ${answerChunks}`);
+          break;
+        }
+        
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -325,20 +359,31 @@ export async function chatCompletions(c: Context) {
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed || !trimmed.startsWith('data: ') || trimmed.includes('[DONE]')) continue;
+          
           try {
             const chunk = JSON.parse(trimmed.slice(6));
+            chunksReceived++;
             const delta = chunk.choices?.[0]?.delta;
             
+            // ✅ LOG CADA CHUNK
+            if (delta) {
+              console.log(`[Chunk #${chunksReceived}] Phase: ${delta.phase || 'none'} | Has Content: ${delta.content !== undefined}`);
+            }
+            
             if (delta?.phase === 'answer' && delta.content !== undefined) {
+              answerChunks++;
               const vStr = getIncrementalDelta(lastAnswerContent, delta.content);
               if (vStr) {
                 fullContent += vStr;
                 lastAnswerContent = delta.content;
+                console.log(`[Answer] +${vStr.length} chars | Total: ${fullContent.length}`);
               }
             }
             
             if (delta?.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
+              thinkingChunks++;
               fullReasoning = delta.extra.summary_thought.content.join('\n');
+              console.log(`[Thinking] ${fullReasoning.length} chars`);
             }
           } catch (e) {
             console.error('[Non-Stream Parse Error]', e);
@@ -359,7 +404,7 @@ export async function chatCompletions(c: Context) {
         cleanText = result.text;
         callsFromFeed = result.toolCalls;
         
-        console.log(`[Tool Parser Result] Clean: "${cleanText.substring(0, 100)}..." | Tool Calls: ${callsFromFeed.length}`);
+        console.log(`[Tool Parser Result] Clean: "${cleanText.substring(0, 100)}..." (${cleanText.length} chars) | Tool Calls: ${callsFromFeed.length}`);
       }
       
       const promptTokens = Math.ceil(finalPrompt.length / 4);
@@ -388,7 +433,6 @@ export async function chatCompletions(c: Context) {
       if (hasToolCallsInResponse) {
         finalContent = null;
       } else {
-        // ✅ Priorizar: cleanText > fullContent > fallback
         finalContent = cleanText || fullContent || "Desculpe, não consegui gerar uma resposta.";
       }
 
