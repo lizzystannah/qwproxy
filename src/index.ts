@@ -22,6 +22,10 @@ dotenv.config();
 export const app = new Hono();
 
 app.use('*', cors());
+app.use('*', async (c, next) => {
+  console.log(`[Request] ${c.req.method} ${c.req.url}`);
+  await next();
+});
 
 // API Key protection middleware
 app.use('/v1/*', async (c, next) => {
@@ -38,8 +42,20 @@ app.get('/health', (c) => c.json({ status: 'ok' }));
 // OpenAI compatible routes
 app.get('/', (c) => c.text('QwenProxy is running! Use /v1/chat/completions for API.'));
 app.post('/v1/chat/completions', chatCompletions);
+app.post('/v1/chat/completions/', chatCompletions);
 
 app.get('/v1/models', async (c) => {
+  try {
+    const models = await fetchQwenModels();
+    return c.json({
+      object: 'list',
+      data: models
+    });
+  } catch (err: any) {
+    return c.json({ error: { message: err.message } }, 500);
+  }
+});
+app.get('/v1/models/', async (c) => {
   try {
     const models = await fetchQwenModels();
     return c.json({
