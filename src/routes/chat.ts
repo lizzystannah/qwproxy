@@ -150,6 +150,7 @@ export async function chatCompletions(c: Context) {
       let fullReasoning = '';
       let buffer = '';
 
+      let lastAnswerContent = '';
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -162,8 +163,12 @@ export async function chatCompletions(c: Context) {
           try {
             const chunk = JSON.parse(trimmed.slice(6));
             const delta = chunk.choices?.[0]?.delta;
-            if (delta?.phase === 'answer' && delta.content) {
-              fullContent = delta.content; // It is cumulative in Qwen original
+            if (delta?.phase === 'answer' && delta.content !== undefined) {
+              const vStr = getIncrementalDelta(lastAnswerContent, delta.content);
+              if (vStr) {
+                fullContent += vStr;
+                lastAnswerContent = delta.content;
+              }
             }
             if (delta?.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
               fullReasoning = delta.extra.summary_thought.content.join('\n');
