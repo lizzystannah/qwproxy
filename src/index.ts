@@ -36,6 +36,7 @@ app.use('/v1/*', async (c, next) => {
 app.get('/health', (c) => c.json({ status: 'ok' }));
 
 // OpenAI compatible routes
+app.get('/', (c) => c.text('QwenProxy is running! Use /v1/chat/completions for API.'));
 app.post('/v1/chat/completions', chatCompletions);
 
 app.get('/v1/models', async (c) => {
@@ -56,7 +57,7 @@ import { fileURLToPath } from 'url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   initPlaywright().then(() => {
     console.log('Playwright initialized.');
-    const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+    const port = process.env.PORT ? parseInt(process.env.PORT) : 3030;
     console.log(`Server is running on port ${port}`);
 
     serve({
