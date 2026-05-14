@@ -157,8 +157,28 @@ export async function chatCompletions(c: Context) {
                     const vStr = getIncrementalDelta(lastFullContent, delta.content);
                     if (vStr) {
                       lastFullContent += vStr;
-                      const { text } = toolParser.feed(vStr);
+                      const { text, toolCalls } = toolParser.feed(vStr);
                       if (text) await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({ content: text })] });
+                      
+                      for (const tc of toolCalls) {
+                        await writeEvent({
+                          id: completionId,
+                          object: 'chat.completion.chunk',
+                          created: Math.floor(Date.now() / 1000),
+                          model: body.model,
+                          choices: [makeChoice({
+                            tool_calls: [{
+                              index: toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc),
+                              id: tc.id,
+                              type: 'function',
+                              function: {
+                                name: tc.name,
+                                arguments: JSON.stringify(tc.arguments)
+                              }
+                            }]
+                          })]
+                        });
+                      }
                     }
                   }
                 }
@@ -166,7 +186,32 @@ export async function chatCompletions(c: Context) {
             } catch (e) {}
           }
         }
-        await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({}, 'stop')] });
+
+        // Finalize tool parser for streaming
+        const { text: remText, toolCalls: remTools } = toolParser.flush();
+        if (remText) await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({ content: remText })] });
+        for (const tc of remTools) {
+          await writeEvent({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: body.model,
+            choices: [makeChoice({
+              tool_calls: [{
+                index: toolParser.getEmittedToolCallCount() - remTools.length + remTools.indexOf(tc),
+                id: tc.id,
+                type: 'function',
+                function: {
+                  name: tc.name,
+                  arguments: JSON.stringify(tc.arguments)
+                }
+              }]
+            })]
+          });
+        }
+
+        const finalFinishReason = toolParser.getEmittedToolCallCount() > 0 ? 'tool_calls' : 'stop';
+        await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({}, finalFinishReason)] });
         await streamWriter.write('data: [DONE]\n\n');
       });
     } else {
