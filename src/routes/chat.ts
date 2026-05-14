@@ -22,7 +22,10 @@ function getIncrementalDelta(oldStr: string, newStr: string): string {
 export async function chatCompletions(c: Context) {
   try {
     const body: OpenAIRequest = await c.req.json();
-    const isStream = body.stream ?? false;
+    console.log(`[Request] POST ${c.req.path} | Model: ${body.model} | Stream: ${body.stream}`);
+    if ((body as any).tools) {
+      console.log(`[Tools] Available: ${(body as any).tools.map((t: any) => t.function?.name).join(', ')}`);
+    }
     const bodyAny = body as any;
     
     // Extract the prompt
