@@ -166,8 +166,8 @@ async function _getQwenHeadersInternal(forceNew = false): Promise<{ headers: Rec
     await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
   }
 
-  // Check if we are on a login page and perform automated login if credentials provided
-  const isLoginPage = activePage.url().includes('login') || (await activePage.$('input[type="email"], input[placeholder*="Email"]'));
+  // Check if we are on a login page or guest page and perform automated login
+  const isLoginPage = activePage.url().includes('login') || activePage.url().includes('auth') || activePage.url().includes('/c/guest') || (await activePage.$('input[type="email"], input[placeholder*="Email"]'));
   if (isLoginPage) {
     const email = process.env.QWEN_EMAIL;
     const password = process.env.QWEN_PASSWORD;

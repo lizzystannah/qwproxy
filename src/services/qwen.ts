@@ -247,6 +247,7 @@ export async function createQwenStream(
 
   if (!response.ok || !response.body) {
     const errText = await response.text().catch(() => '');
+    console.error(`[Qwen API Error] Status: ${response.status} - ${errText}`);
     throw new Error(`Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`);
   }
 
