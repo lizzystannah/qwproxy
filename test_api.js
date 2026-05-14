@@ -21,7 +21,7 @@ async function test() {
     });
 
     const data = await response.json();
-    console.log('\n--- RESPOSTA DA API ---');
+    console.log('02199503090909060854F');
     console.log(JSON.stringify(data, null, 2));
     console.log('-----------------------\n');
 
