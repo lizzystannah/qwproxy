@@ -23,10 +23,13 @@ export async function chatCompletions(c: Context) {
   try {
     const body: OpenAIRequest = await c.req.json();
     console.log(`[Request] POST ${c.req.path} | Model: ${body.model} | Stream: ${body.stream}`);
+    
     if ((body as any).tools) {
       console.log(`[Tools] Available: ${(body as any).tools.map((t: any) => t.function?.name).join(', ')}`);
     }
+
     const bodyAny = body as any;
+    const isStream = body.stream === true;
     
     // Extract the prompt
     let prompt = '';
@@ -65,7 +68,7 @@ export async function chatCompletions(c: Context) {
       } else if (i === messages.length - 1) {
         // Inject tools instructions right before the last message
         if (toolsJson) {
-          systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file1.txt"}}\n</tool_call>\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file2.txt"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n\n`;
+          systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text after your <tool_call> blocks.\n4. The JSON inside the tags MUST be valid.\n\n`;
           
           if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
             const forcedTool = bodyAny.tool_choice.function.name;
@@ -112,19 +115,21 @@ export async function chatCompletions(c: Context) {
         const writeEvent = async (data: any) => {
           await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
         };
+        
         const makeChoice = (delta: any, finishReason: string | null = null) => ({
           index: 0,
-          delta,
+          delta: delta,
           logprobs: null,
           finish_reason: finishReason
         });
 
+        // First chunk
         await writeEvent({
           id: completionId,
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
           model: body.model,
-          choices: [makeChoice({ role: 'assistant', content: '' })]
+          choices: [makeChoice({ role: 'assistant' })]
         });
 
         const reader = stream.getReader();
@@ -133,6 +138,7 @@ export async function chatCompletions(c: Context) {
         const toolParser = new StreamingToolParser();
         let buffer = '';
         let currentThoughtIndex = 0;
+        let hasEmittedContent = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -159,9 +165,7 @@ export async function chatCompletions(c: Context) {
                    if (delta.extra?.summary_thought?.content) {
                       const thoughts = delta.extra.summary_thought.content;
                       if (thoughts.length > currentThoughtIndex) {
-                        const vStr = thoughts.slice(currentThoughtIndex).join('\n');
                         currentThoughtIndex = thoughts.length;
-                        await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({ reasoning_content: vStr })] });
                       }
                    }
                 } else if (delta.phase === 'answer') {
@@ -170,9 +174,22 @@ export async function chatCompletions(c: Context) {
                     if (vStr) {
                       lastFullContent += vStr;
                       const { text, toolCalls } = toolParser.feed(vStr);
-                      if (text) await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({ content: text })] });
+                      
+                      if (text) {
+                        hasEmittedContent = true;
+                        await writeEvent({ 
+                          id: completionId, 
+                          object: 'chat.completion.chunk', 
+                          created: Math.floor(Date.now() / 1000), 
+                          model: body.model, 
+                          choices: [makeChoice({ content: text })] 
+                        });
+                      }
                       
                       for (const tc of toolCalls) {
+                        const argsString = typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments);
+                        const toolCallIndex = toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc);
+                        
                         await writeEvent({
                           id: completionId,
                           object: 'chat.completion.chunk',
@@ -180,13 +197,10 @@ export async function chatCompletions(c: Context) {
                           model: body.model,
                           choices: [makeChoice({
                             tool_calls: [{
-                              index: toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc),
+                              index: toolCallIndex,
                               id: tc.id,
                               type: 'function',
-                              function: {
-                                name: tc.name,
-                                arguments: JSON.stringify(tc.arguments)
-                              }
+                              function: { name: tc.name, arguments: argsString }
                             }]
                           })]
                         });
@@ -199,10 +213,14 @@ export async function chatCompletions(c: Context) {
           }
         }
 
-        // Finalize tool parser for streaming
         const { text: remText, toolCalls: remTools } = toolParser.flush();
-        if (remText) await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({ content: remText })] });
+        if (remText) {
+          hasEmittedContent = true;
+          await writeEvent({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model, choices: [makeChoice({ content: remText })] });
+        }
         for (const tc of remTools) {
+          const argsString = typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments);
+          const toolCallIndex = toolParser.getEmittedToolCallCount() - remTools.length + remTools.indexOf(tc);
           await writeEvent({
             id: completionId,
             object: 'chat.completion.chunk',
@@ -210,13 +228,10 @@ export async function chatCompletions(c: Context) {
             model: body.model,
             choices: [makeChoice({
               tool_calls: [{
-                index: toolParser.getEmittedToolCallCount() - remTools.length + remTools.indexOf(tc),
+                index: toolCallIndex,
                 id: tc.id,
                 type: 'function',
-                function: {
-                  name: tc.name,
-                  arguments: JSON.stringify(tc.arguments)
-                }
+                function: { name: tc.name, arguments: argsString }
               }]
             })]
           });
@@ -233,8 +248,8 @@ export async function chatCompletions(c: Context) {
       let fullContent = '';
       let fullReasoning = '';
       let buffer = '';
-
       let lastAnswerContent = '';
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -261,13 +276,21 @@ export async function chatCompletions(c: Context) {
         }
       }
 
-      // Process the whole content at once for tools
       const toolParser = new StreamingToolParser();
       toolParser.feed(fullContent);
       const { text: cleanText, toolCalls: callsFromFeed } = toolParser.flush();
       
       const promptTokens = Math.ceil(finalPrompt.length / 4);
       const completionTokens = Math.ceil((cleanText || fullContent || '').length / 4);
+
+      const formattedToolCalls = callsFromFeed.map((tc) => ({
+        id: tc.id,
+        type: 'function' as const,
+        function: {
+          name: tc.name,
+          arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments)
+        }
+      }));
 
       const responseBody = {
         id: completionId,
@@ -278,18 +301,11 @@ export async function chatCompletions(c: Context) {
           index: 0,
           message: {
             role: 'assistant',
-            content: (callsFromFeed.length > 0) ? "" : (cleanText || fullContent || ""),
+            content: formattedToolCalls.length > 0 ? "" : (cleanText || fullContent || ""),
             reasoning_content: fullReasoning || undefined,
-            tool_calls: callsFromFeed.length > 0 ? callsFromFeed.map((tc, idx) => ({
-              id: tc.id,
-              type: 'function',
-              function: {
-                name: tc.name,
-                arguments: JSON.stringify(tc.arguments)
-              }
-            })) : undefined
+            tool_calls: formattedToolCalls.length > 0 ? formattedToolCalls : undefined
           },
-          finish_reason: callsFromFeed.length > 0 ? 'tool_calls' : 'stop'
+          finish_reason: formattedToolCalls.length > 0 ? 'tool_calls' : 'stop'
         }],
         usage: { 
           prompt_tokens: promptTokens, 
@@ -298,11 +314,11 @@ export async function chatCompletions(c: Context) {
         }
       };
 
-      console.log(`[Response] ${completionId} | Content Length: ${responseBody.choices[0].message.content?.length || 0} | Tools: ${callsFromFeed.length}`);
+      console.log(`[Response] ${completionId} | Content: ${responseBody.choices[0].message.content?.length || 0} chars | Tools: ${formattedToolCalls.length}`);
       return c.json(responseBody);
     }
   } catch (err: any) {
-    console.error('Error in chatCompletions:', err);
-    return c.json({ error: { message: err.message, type: 'server_error' } }, 500);
+    console.error('❌ Error in chatCompletions:', err);
+    return c.json({ error: { message: err.message || 'Internal error', type: 'server_error' } }, 500);
   }
 }
