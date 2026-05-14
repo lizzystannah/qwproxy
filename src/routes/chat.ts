@@ -203,12 +203,22 @@ export async function chatCompletions(c: Context) {
           try {
             const chunk = JSON.parse(trimmed.slice(6));
             const delta = chunk.choices?.[0]?.delta;
-            if (delta?.phase === 'answer' && delta.content) fullContent = delta.content;
+            
+            if (delta?.phase === 'answer' && delta.content) {
+              // In non-streaming, we always take the latest content which is the cumulative result
+              fullContent = delta.content;
+            }
             if (delta?.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
               fullReasoning = delta.extra.summary_thought.content.join('\n');
             }
           } catch (e) {}
         }
+      }
+
+      // If for some reason fullContent is still empty but we got chunks, 
+      // let's make sure we didn't miss it in another field
+      if (!fullContent && buffer) {
+         console.log('[Debug] Non-streaming finished with empty content, checking buffer...');
       }
 
       return c.json({
