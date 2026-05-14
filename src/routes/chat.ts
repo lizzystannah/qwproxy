@@ -266,6 +266,9 @@ export async function chatCompletions(c: Context) {
       toolParser.feed(fullContent);
       const { text: cleanText, toolCalls: callsFromFeed } = toolParser.flush();
       
+      const promptTokens = Math.ceil(finalPrompt.length / 4);
+      const completionTokens = Math.ceil((cleanText || fullContent || '').length / 4);
+
       return c.json({
         id: completionId,
         object: 'chat.completion',
@@ -288,7 +291,11 @@ export async function chatCompletions(c: Context) {
           },
           finish_reason: callsFromFeed.length > 0 ? 'tool_calls' : 'stop'
         }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        usage: { 
+          prompt_tokens: promptTokens, 
+          completion_tokens: completionTokens, 
+          total_tokens: promptTokens + completionTokens 
+        }
       });
     }
   } catch (err: any) {
