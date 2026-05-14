@@ -27,6 +27,6 @@ RUN npx playwright install chromium --with-deps
 
 COPY . .
 
-EXPOSE 3000
+EXPOSE 3030
 
 CMD ["npm", "start"]
