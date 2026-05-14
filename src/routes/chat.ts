@@ -23,12 +23,29 @@ export async function chatCompletions(c: Context) {
   try {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
+    const bodyAny = body as any;
     
     // Extract the prompt
     let prompt = '';
     const messages = body.messages || [];
     let systemPrompt = '';
     
+    // Process tools if present
+    let toolsJson = '';
+    if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
+      const formattedTools = bodyAny.tools.map((t: any) => {
+        if (t.type === 'function') {
+          return {
+            name: t.function.name,
+            description: t.function.description || '',
+            parameters: t.function.parameters
+          };
+        }
+        return t;
+      });
+      toolsJson = JSON.stringify(formattedTools, null, 2);
+    }
+
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       let contentStr = '';
@@ -43,6 +60,16 @@ export async function chatCompletions(c: Context) {
       if (msg.role === 'system') {
         systemPrompt += contentStr + '\n\n';
       } else if (i === messages.length - 1) {
+        // Inject tools instructions right before the last message
+        if (toolsJson) {
+          systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file1.txt"}}\n</tool_call>\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file2.txt"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n\n`;
+          
+          if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
+            const forcedTool = bodyAny.tool_choice.function.name;
+            systemPrompt += `CRITICAL: You MUST call the tool "${forcedTool}" in this response.\n\n`;
+          }
+        }
+        
         if (msg.role === 'user') {
           prompt += `User: ${contentStr}\n\n`;
         } else if (msg.role === 'assistant') {
@@ -150,7 +177,9 @@ export async function chatCompletions(c: Context) {
       let fullReasoning = '';
       let buffer = '';
 
+      const toolParser = new StreamingToolParser();
       let lastAnswerContent = '';
+      
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -166,6 +195,7 @@ export async function chatCompletions(c: Context) {
             if (delta?.phase === 'answer' && delta.content !== undefined) {
               const vStr = getIncrementalDelta(lastAnswerContent, delta.content);
               if (vStr) {
+                toolParser.feed(vStr); // Feed to parser to catch tools
                 fullContent += vStr;
                 lastAnswerContent = delta.content;
               }
@@ -177,6 +207,8 @@ export async function chatCompletions(c: Context) {
         }
       }
 
+      const { text: cleanText, toolCalls } = toolParser.flush();
+      
       return c.json({
         id: completionId,
         object: 'chat.completion',
@@ -186,10 +218,18 @@ export async function chatCompletions(c: Context) {
           index: 0,
           message: {
             role: 'assistant',
-            content: fullContent,
-            reasoning_content: fullReasoning || undefined
+            content: cleanText || '',
+            reasoning_content: fullReasoning || undefined,
+            tool_calls: toolCalls.length > 0 ? toolCalls.map((tc, idx) => ({
+              id: tc.id,
+              type: 'function',
+              function: {
+                name: tc.name,
+                arguments: JSON.stringify(tc.arguments)
+              }
+            })) : undefined
           },
-          finish_reason: 'stop'
+          finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
         }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       });
