@@ -65,6 +65,8 @@ app.get('/debug/login', async (c) => {
 app.get('/', (c) => c.text('QwenProxy is running! Use /v1/chat/completions for API.'));
 app.post('/v1/chat/completions', chatCompletions);
 app.post('/v1/chat/completions/', chatCompletions);
+app.post('/v1/responses', chatCompletions);
+app.post('/v1/responses/', chatCompletions);
 
 app.get('/v1/models', async (c) => {
   try {
