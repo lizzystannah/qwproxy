@@ -156,114 +156,33 @@ export async function fetchQwenModels(): Promise<any[]> {
   return [];
 }
 
-// ✅ Criar novo chat no Qwen e retornar chat_id
-async function createQwenChat(
-  headers: Record<string, string>,
-  model: string
-): Promise<string> {
-  const chatId = uuidv4();
-  
-  console.log(`[Qwen] Creating new chat | ID: ${chatId}`);
-  
-  const payload = {
-    chat_id: chatId,
-    model: model,
-    chat_mode: 'normal',
-    title: 'New Chat'
-  };
-
-  const response = await fetch('https://chat.qwen.ai/api/v2/chats/create', {
-    method: 'POST',
-    headers: {
-      'accept': 'application/json, text/plain, */*',
-      'accept-language': 'pt-BR,pt;q=0.9',
-      'content-type': 'application/json',
-      'cookie': headers['cookie'],
-      'origin': 'https://chat.qwen.ai',
-      'referer': 'https://chat.qwen.ai/',
-      'user-agent': headers['user-agent'],
-      'x-request-id': uuidv4(),
-      'bx-ua': headers['bx-ua'],
-      'bx-umidtoken': headers['bx-umidtoken'],
-      'bx-v': headers['bx-v']
-    },
-    body: JSON.stringify(payload)
-  });
-
-  const responseText = await response.text();
-  console.log(`[Qwen] Create chat response: ${response.status} | Body: ${responseText.substring(0, 200)}`);
-
-  if (response.ok) {
-    try {
-      const json = JSON.parse(responseText);
-      // ✅ Retornar chat_id da resposta ou o que geramos
-      const returnedId = json?.data?.chat_id || json?.chat_id || chatId;
-      console.log(`[Qwen] ✅ Chat created: ${returnedId}`);
-      return returnedId;
-    } catch {
-      console.log(`[Qwen] Using generated chat_id: ${chatId}`);
-      return chatId;
-    }
-  }
-
-  // ✅ Se falhou criar, usar o UUID gerado mesmo (alguns casos aceita)
-  console.warn(`[Qwen] Create chat failed (${response.status}), using generated ID: ${chatId}`);
-  return chatId;
-}
-
-// ✅ Separar system prompt do user message
-function splitPrompt(fullPrompt: string): { systemContent: string; userContent: string } {
-  const userPrefix = 'User: ';
-  const lastUserIndex = fullPrompt.lastIndexOf(userPrefix);
-  
-  if (lastUserIndex === -1) {
-    return { systemContent: '', userContent: fullPrompt };
-  }
-  
-  const systemContent = fullPrompt.substring(0, lastUserIndex).trim();
-  const userContent = fullPrompt.substring(lastUserIndex + userPrefix.length).trim();
-  
-  return { systemContent, userContent };
-}
-
-// ✅ Truncar system preservando user message
-function buildFinalContent(prompt: string, maxChars: number): string {
-  if (prompt.length <= maxChars) return prompt;
-  
-  const { systemContent, userContent } = splitPrompt(prompt);
-  
-  if (userContent) {
-    const maxSystemChars = Math.max(maxChars - userContent.length - 100, 1000);
-    const truncatedSystem = systemContent.length > maxSystemChars
-      ? systemContent.substring(0, maxSystemChars) + '\n\n[...]\n\n'
-      : systemContent;
-    
-    const result = `${truncatedSystem}\n\nUser: ${userContent}`;
-    console.log(`[Qwen] Prompt truncated: ${prompt.length} → ${result.length} chars`);
-    return result;
-  }
-  
-  return prompt.substring(0, maxChars);
-}
-
 export async function createQwenStream(
   prompt: string, 
   enableThinking: boolean, 
   modelId: string,
   forcedParentId?: string | null
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string }> {
-  
-  console.log(`[Qwen] Creating stream | Prompt: ${prompt.length} chars | Thinking: ${enableThinking} | forcedParentId: ${String(forcedParentId)}`);
-  
+
+  console.log(`[Qwen] Creating stream | Prompt: ${prompt.length} chars | Thinking: ${enableThinking}`);
+
   const isNewSession = forcedParentId === null;
-  
+
+  // ✅ Playwright digita no chat e captura os headers reais + chat_id da sessão
   const { headers, chatSessionId, parentMessageId } = await getQwenHeaders(isNewSession);
 
+  console.log(`[Qwen] chatSessionId from Playwright: "${chatSessionId}" | parentMessageId: "${parentMessageId}"`);
+
+  // ✅ O chatSessionId vem do Playwright (URL do chat aberto)
+  // Ele SEMPRE deve ser uma string válida pois o Playwright abre um chat real
+  if (!chatSessionId) {
+    throw new Error('Playwright did not return a valid chatSessionId. Check playwright.ts');
+  }
+
   let actualParentId: string | null = parentMessageId;
-  
-  if (forcedParentId !== undefined) {
+
+  if (forcedParentId !== undefined && forcedParentId !== null) {
     actualParentId = forcedParentId;
-  } else if (chatSessionId && sessionStates[chatSessionId] !== undefined) {
+  } else if (sessionStates[chatSessionId] !== undefined) {
     actualParentId = sessionStates[chatSessionId];
   }
 
@@ -271,30 +190,13 @@ export async function createQwenStream(
   const fid = uuidv4();
   const model = modelId.replace('-no-thinking', '');
 
-  // ✅ Truncar prompt se necessário
-  const finalContent = buildFinalContent(prompt, 8000);
-  const { systemContent, userContent } = splitPrompt(finalContent);
-  console.log(`[Qwen] System: ${systemContent.length} chars | User: ${userContent.length} chars | Total: ${finalContent.length} chars`);
-
-  // ✅ CRÍTICO: chat_id SEMPRE deve ser string válida
-  // Se temos chatSessionId do Playwright, usar ele
-  // Se é nova sessão, criar novo chat via API
-  let effectiveChatId: string = chatSessionId || '';
-  
-  if (!effectiveChatId || isNewSession) {
-    // ✅ Criar novo chat para obter chat_id válido
-    effectiveChatId = await createQwenChat(headers, model);
-    // ✅ Resetar parent para nova sessão
-    actualParentId = null;
-  }
-
-  console.log(`[Qwen] Using chat_id: ${effectiveChatId} | parent_id: ${actualParentId}`);
+  console.log(`[Qwen] chat_id: ${chatSessionId} | parent_id: ${actualParentId}`);
 
   const payload: QwenPayload = {
     stream: true,
     version: '2.1',
     incremental_output: true,
-    chat_id: effectiveChatId,      // ✅ SEMPRE string válida
+    chat_id: chatSessionId,        // ✅ SEMPRE string válida vinda do Playwright
     chat_mode: 'normal',
     model: model,
     parent_id: actualParentId,
@@ -304,7 +206,7 @@ export async function createQwenStream(
         parentId: actualParentId,
         childrenIds: [],
         role: 'user',
-        content: finalContent,
+        content: prompt,            // ✅ Prompt original sem truncamento
         user_action: 'chat',
         files: [],
         timestamp: timestamp,
@@ -317,7 +219,7 @@ export async function createQwenStream(
           auto_thinking: false,
           thinking_mode: 'Thinking',
           thinking_format: 'summary',
-          auto_search: false,      // ✅ SEMPRE false
+          auto_search: true,        // ✅ REVERTIDO: manter original
         },
         extra: {
           meta: {
@@ -331,8 +233,8 @@ export async function createQwenStream(
     timestamp: timestamp + 1
   };
 
-  // ✅ URL SEMPRE com chat_id
-  const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${effectiveChatId}`;
+  // ✅ URL sempre com chat_id (obrigatório pela API do Qwen)
+  const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatSessionId}`;
 
   console.log(`[Qwen] POST ${url}`);
 
@@ -344,11 +246,11 @@ export async function createQwenStream(
       'content-type': 'application/json',
       'cookie': headers['cookie'],
       'origin': 'https://chat.qwen.ai',
-      'referer': `https://chat.qwen.ai/c/${effectiveChatId}`,
+      'referer': `https://chat.qwen.ai/c/${chatSessionId}`,
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
-      'timezone': new Date().toString().split(' (')[0], 
+      'timezone': new Date().toString().split(' (')[0],
       'user-agent': headers['user-agent'],
       'x-accel-buffering': 'no',
       'x-request-id': uuidv4(),
@@ -361,14 +263,14 @@ export async function createQwenStream(
 
   const contentType = response.headers.get('content-type') || '';
   const contentLength = response.headers.get('content-length') || 'unknown';
-  
+
   console.log(`[Qwen] Response: ${response.status} | Content-Type: ${contentType} | Content-Length: ${contentLength}`);
 
-  // ✅ Detectar erro JSON
+  // ✅ Detectar erro JSON (não é stream)
   if (contentType.includes('application/json') || !response.ok) {
     const errorBody = await response.text().catch(() => '(unreadable)');
-    console.error(`[Qwen] ❌ Error: ${errorBody}`);
-    
+    console.error(`[Qwen] ❌ Error body: ${errorBody}`);
+
     try {
       const errorJson = JSON.parse(errorBody);
       const msg = errorJson?.data?.details || errorJson?.message || errorJson?.error || errorBody;
@@ -383,6 +285,6 @@ export async function createQwenStream(
     throw new Error(`Qwen returned empty body (${response.status})`);
   }
 
-  console.log(`[Qwen] ✅ Stream started | chat_id: ${effectiveChatId}`);
-  return { stream: response.body, headers, uiSessionId: effectiveChatId };
+  console.log(`[Qwen] ✅ Stream started | chat_id: ${chatSessionId}`);
+  return { stream: response.body, headers, uiSessionId: chatSessionId };
 }
