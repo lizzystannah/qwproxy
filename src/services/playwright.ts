@@ -20,7 +20,7 @@ interface QwenSession {
   createdAt: number;
 }
 
-const sessionPool: QwenSession[] = [];
+export const sessionPool: QwenSession[] = [];
 const MAX_REQUESTS_PER_SESSION = 5; // ✅ Limite de requisições por chat
 const MAX_SESSIONS = 10; // ✅ Máximo de sessões simultâneas
 let currentSessionIndex = 0;

@@ -14,9 +14,8 @@ import { cors } from 'hono/cors';
 import { bearerAuth } from 'hono/bearer-auth';
 import { chatCompletions } from './routes/chat.ts';
 import { fetchQwenModels } from './services/qwen.ts';
-import { activePage } from './services/playwright.ts';
-import * as dotenv from 'dotenv';
 import { initPlaywright } from './services/playwright.ts';
+import * as dotenv from 'dotenv';
 
 dotenv.config();
 
@@ -40,24 +39,18 @@ app.use('/v1/*', async (c, next) => {
 // Basic health check
 app.get('/health', (c) => c.json({ status: 'ok' }));
 
-app.get('/debug/login', async (c) => {
-  if (!activePage) return c.json({ status: 'Playwright not initialized' });
-  
-  let url = activePage.url();
-  if (url === 'about:blank') {
-    console.log('[Debug] Page is blank, navigating to Qwen...');
-    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
-    url = activePage.url();
-  }
-  
-  const content = await activePage.content();
-  const isLogged = content.includes('data-testid="chat-input-textarea"') || content.includes('qwen-logo') || (!url.includes('auth') && url !== 'about:blank');
+app.get('/debug/status', async (c) => {
+  // Importação dinâmica para evitar dependência circular se necessário
+  const { sessionPool } = await import('./services/playwright.ts');
   
   return c.json({
-    url: url,
-    is_logged_in: isLogged,
-    has_chat_input: content.includes('textarea') || content.includes('contenteditable'),
-    page_title: await activePage.title()
+    status: 'Playwright initialized',
+    sessions_active: sessionPool.length,
+    sessions: sessionPool.map(s => ({
+      chat_id: s.chatSessionId,
+      requests: s.requestCount,
+      age: Math.floor((Date.now() - s.createdAt) / 1000) + 's'
+    }))
   });
 });
 
