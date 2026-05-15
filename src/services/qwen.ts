@@ -156,33 +156,12 @@ export async function fetchQwenModels(): Promise<any[]> {
   return [];
 }
 
-// ✅ Limite seguro de caracteres por mensagem para o Qwen
-const QWEN_SAFE_PROMPT_LIMIT = 8000;
-
-// ✅ Truncar prompt preservando início e fim (mais importante)
-function truncatePrompt(prompt: string, maxChars: number): string {
-  if (prompt.length <= maxChars) return prompt;
-  
-  console.warn(`[Qwen] Prompt truncado: ${prompt.length} → ${maxChars} chars`);
-  
-  // ✅ Preservar 70% do início (system prompt + tools) e 30% do fim (última mensagem)
-  const keepStart = Math.floor(maxChars * 0.7);
-  const keepEnd = Math.floor(maxChars * 0.3);
-  
-  const start = prompt.substring(0, keepStart);
-  const end = prompt.substring(prompt.length - keepEnd);
-  
-  return `${start}\n\n[... contexto truncado por tamanho ...]\n\n${end}`;
-}
-
-// ✅ Separar system prompt do user prompt para enviar corretamente
+// ✅ Separar system prompt do user message
 function splitPrompt(fullPrompt: string): { systemContent: string; userContent: string } {
-  // ✅ Tentar encontrar a última mensagem "User:" no prompt
   const userPrefix = 'User: ';
   const lastUserIndex = fullPrompt.lastIndexOf(userPrefix);
   
   if (lastUserIndex === -1) {
-    // Sem separação clara, enviar tudo como user
     return { systemContent: '', userContent: fullPrompt };
   }
   
@@ -192,6 +171,26 @@ function splitPrompt(fullPrompt: string): { systemContent: string; userContent: 
   return { systemContent, userContent };
 }
 
+// ✅ Truncar system preservando user message
+function buildFinalContent(prompt: string, maxChars: number): string {
+  if (prompt.length <= maxChars) return prompt;
+  
+  const { systemContent, userContent } = splitPrompt(prompt);
+  
+  if (userContent) {
+    const maxSystemChars = Math.max(maxChars - userContent.length - 100, 1000);
+    const truncatedSystem = systemContent.length > maxSystemChars
+      ? systemContent.substring(0, maxSystemChars) + '\n\n[...]\n\n'
+      : systemContent;
+    
+    const result = `${truncatedSystem}\n\nUser: ${userContent}`;
+    console.log(`[Qwen] Prompt truncated: ${prompt.length} → ${result.length} chars`);
+    return result;
+  }
+  
+  return prompt.substring(0, maxChars);
+}
+
 export async function createQwenStream(
   prompt: string, 
   enableThinking: boolean, 
@@ -199,9 +198,12 @@ export async function createQwenStream(
   forcedParentId?: string | null
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string }> {
   
-  console.log(`[Qwen] Creating stream | Prompt: ${prompt.length} chars | Thinking: ${enableThinking}`);
+  console.log(`[Qwen] Creating stream | Prompt: ${prompt.length} chars | Thinking: ${enableThinking} | forcedParentId: ${forcedParentId}`);
   
-  const { headers, chatSessionId, parentMessageId } = await getQwenHeaders(forcedParentId === null);
+  // ✅ forcedParentId === null significa nova sessão → não passar chat_id
+  const isNewSession = forcedParentId === null;
+  
+  const { headers, chatSessionId, parentMessageId } = await getQwenHeaders(isNewSession);
 
   let actualParentId: string | null = parentMessageId;
   
@@ -215,34 +217,21 @@ export async function createQwenStream(
   const fid = uuidv4();
   const model = modelId.replace('-no-thinking', '');
 
-  // ✅ Separar system e user content
-  const { systemContent, userContent } = splitPrompt(prompt);
+  // ✅ Truncar prompt se necessário (limite seguro: 8000 chars)
+  const finalContent = buildFinalContent(prompt, 8000);
   
-  console.log(`[Qwen] System: ${systemContent.length} chars | User: ${userContent.length} chars`);
+  const { systemContent, userContent } = splitPrompt(finalContent);
+  console.log(`[Qwen] System: ${systemContent.length} chars | User: ${userContent.length} chars | Total: ${finalContent.length} chars`);
 
-  // ✅ Truncar se necessário para evitar falha silenciosa do Qwen
-  let finalContent = prompt;
-
-  if (prompt.length > QWEN_SAFE_PROMPT_LIMIT) {
-    // ✅ Estratégia: comprimir system e preservar user message completa
-    if (userContent && systemContent) {
-      const maxSystemChars = Math.max(QWEN_SAFE_PROMPT_LIMIT - userContent.length - 100, 2000);
-      const truncatedSystem = systemContent.length > maxSystemChars
-        ? systemContent.substring(0, maxSystemChars) + '\n\n[instrucoes truncadas]\n\n'
-        : systemContent;
-      
-      finalContent = `${truncatedSystem}\n\nUser: ${userContent}`;
-      console.log(`[Qwen] Truncated prompt: ${prompt.length} → ${finalContent.length} chars`);
-    } else {
-      finalContent = truncatePrompt(prompt, QWEN_SAFE_PROMPT_LIMIT);
-    }
-  }
+  // ✅ CRÍTICO: Para nova sessão, NÃO usar chat_id
+  // Para sessão existente, usar chat_id apenas se válido
+  const effectiveChatId = isNewSession ? null : (chatSessionId || null);
 
   const payload: QwenPayload = {
     stream: true,
     version: '2.1',
     incremental_output: true,
-    chat_id: chatSessionId || null,
+    chat_id: effectiveChatId,
     chat_mode: 'normal',
     model: model,
     parent_id: actualParentId,
@@ -252,7 +241,7 @@ export async function createQwenStream(
         parentId: actualParentId,
         childrenIds: [],
         role: 'user',
-        content: finalContent,  // ✅ Usar content truncado/otimizado
+        content: finalContent,
         user_action: 'chat',
         files: [],
         timestamp: timestamp,
@@ -265,7 +254,7 @@ export async function createQwenStream(
           auto_thinking: false,
           thinking_mode: 'Thinking',
           thinking_format: 'summary',
-          auto_search: false,    // ✅ CRÍTICO: Desativar auto_search para evitar timeout
+          auto_search: false, // ✅ SEMPRE false para evitar timeout
         },
         extra: {
           meta: {
@@ -279,11 +268,12 @@ export async function createQwenStream(
     timestamp: timestamp + 1
   };
 
-  const url = chatSessionId 
-    ? `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatSessionId}`
+  // ✅ URL sem chat_id para nova sessão
+  const url = effectiveChatId
+    ? `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${effectiveChatId}`
     : 'https://chat.qwen.ai/api/v2/chat/completions';
 
-  console.log(`[Qwen] Sending to ${url} | Final prompt: ${finalContent.length} chars | auto_search: false`);
+  console.log(`[Qwen] POST ${url} | chat_id: ${effectiveChatId || 'none'} | parent_id: ${actualParentId || 'none'}`);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -293,7 +283,9 @@ export async function createQwenStream(
       'content-type': 'application/json',
       'cookie': headers['cookie'],
       'origin': 'https://chat.qwen.ai',
-      'referer': chatSessionId ? `https://chat.qwen.ai/c/${chatSessionId}` : 'https://chat.qwen.ai/',
+      'referer': effectiveChatId
+        ? `https://chat.qwen.ai/c/${effectiveChatId}`
+        : 'https://chat.qwen.ai/',
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
@@ -308,18 +300,30 @@ export async function createQwenStream(
     body: JSON.stringify(payload)
   });
 
-  console.log(`[Qwen] Response status: ${response.status} | Has body: ${!!response.body}`);
+  const contentType = response.headers.get('content-type') || '';
+  const contentLength = response.headers.get('content-length') || 'unknown';
+  
+  console.log(`[Qwen] Response: ${response.status} | Content-Type: ${contentType} | Content-Length: ${contentLength}`);
 
-  if (!response.ok || !response.body) {
-    const errText = await response.text().catch(() => '');
-    console.error(`[Qwen] Error response: ${errText.substring(0, 500)}`);
-    throw new Error(`Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`);
+  // ✅ CRÍTICO: Detectar resposta JSON de erro (não é stream)
+  if (!response.ok || contentType.includes('application/json')) {
+    const errorBody = await response.text().catch(() => '(unreadable)');
+    console.error(`[Qwen] ❌ Error response body: ${errorBody}`);
+    
+    // ✅ Tentar parsear para dar mensagem clara
+    try {
+      const errorJson = JSON.parse(errorBody);
+      const msg = errorJson.message || errorJson.error || errorJson.msg || errorBody;
+      throw new Error(`Qwen API error (${response.status}): ${msg}`);
+    } catch (parseErr) {
+      throw new Error(`Qwen API error (${response.status}): ${errorBody}`);
+    }
   }
 
-  // ✅ Verificar se response está retornando conteúdo imediatamente
-  const contentLength = response.headers.get('content-length');
-  const contentType = response.headers.get('content-type');
-  console.log(`[Qwen] Content-Type: ${contentType} | Content-Length: ${contentLength}`);
+  if (!response.body) {
+    throw new Error(`Qwen returned empty body (${response.status})`);
+  }
 
+  console.log(`[Qwen] ✅ Stream started successfully`);
   return { stream: response.body, headers, uiSessionId: chatSessionId };
 }
