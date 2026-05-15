@@ -56,11 +56,20 @@ async function createNewSession(): Promise<QwenSession> {
 
   // Navegar para Qwen
   console.log('[Playwright] Navigating to Qwen...');
-  await page.goto('https://chat.qwen.ai', { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(2000);
+  await page.goto('https://chat.qwen.ai', { waitUntil: 'networkidle', timeout: 60000 });
+  await page.waitForTimeout(3000);
 
-  // Aguardar input estar pronto
-  await page.waitForSelector('.message-input-area textarea, input[placeholder*="Message"]', { timeout: 10000 });
+  // Aguardar input estar pronto (Seletores mais robustos)
+  const selectors = [
+    '.message-input-area textarea',
+    'textarea[placeholder*="Message"]',
+    'input[placeholder*="Message"]',
+    '[contenteditable="true"]',
+    'textarea'
+  ];
+  
+  console.log('[Playwright] Waiting for message input...');
+  await page.waitForSelector(selectors.join(', '), { timeout: 30000 });
 
   // ✅ Disparar uma mensagem dummy para criar chat e capturar headers
   let headers: Record<string, string> = {};
@@ -68,7 +77,7 @@ async function createNewSession(): Promise<QwenSession> {
 
   const interceptPromise = page.waitForResponse(
     (response) => response.url().includes('/api/v2/chat/completions'),
-    { timeout: 15000 }
+    { timeout: 30000 }
   ).then(async (response) => {
     const reqHeaders = response.request().headers();
     headers = {
@@ -86,8 +95,8 @@ async function createNewSession(): Promise<QwenSession> {
   });
 
   // Disparar mensagem
-  const inputSelector = '.message-input-area textarea, input[placeholder*="Message"]';
-  await page.fill(inputSelector, '.');
+  const combinedSelector = selectors.join(', ');
+  await page.fill(combinedSelector, '.');
   await page.waitForTimeout(500);
   await page.keyboard.press('Enter');
 
