@@ -2,322 +2,242 @@
  * File: playwright.ts
  * Project: qwenproxy
  * Author: Pedro Farias
- * Created: 2026-05-09
+ * Created: 2026-05-12
  * 
- * Last Modified: Sat May 09 2026
- * Modified By: Pedro Farias
+ * Sistema de rotação de sessões para evitar rate limit
  */
 
-import { chromium, BrowserContext, Page } from 'playwright';
-import path from 'path';
-import crypto from 'crypto';
+import { chromium, Browser, BrowserContext, Page } from 'playwright';
 
-let context: BrowserContext | null = null;
-export let activePage: Page | null = null;
-let currentHeaders: Record<string, string> = {};
-let cachedQwenHeaders: { headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null } | null = null;
-let lastHeadersTime = 0;
-const HEADERS_TTL = 10 * 60 * 1000; // 10 minutes
+let browser: Browser | null = null;
 
-// Lock to prevent concurrent UI interactions
-let uiLock: Promise<void> = Promise.resolve();
-
-export async function getCookies(): Promise<string> {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) return 'token=mock';
-  if (!activePage) return '';
-  const cookies = await activePage.context().cookies();
-  return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+// ✅ Pool de sessões ativas
+interface QwenSession {
+  context: BrowserContext;
+  page: Page;
+  chatSessionId: string;
+  requestCount: number;
+  createdAt: number;
 }
 
-export async function getBasicHeaders(): Promise<{ cookie: string, userAgent: string, bxV: string }> {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: '2.5.36' };
-  if (!activePage) throw new Error('Playwright not initialized');
-  
-  const cookie = await getCookies();
-  const userAgent = await activePage.evaluate(() => navigator.userAgent);
-  const bxV = currentHeaders['bx-v'] || '2.5.36';
-  
-  return { cookie, userAgent, bxV };
-}
+const sessionPool: QwenSession[] = [];
+const MAX_REQUESTS_PER_SESSION = 5; // ✅ Limite de requisições por chat
+const MAX_SESSIONS = 10; // ✅ Máximo de sessões simultâneas
+let currentSessionIndex = 0;
 
-export async function initPlaywright(headless = true) {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) return;
-  if (context) {
-    return;
-  }
-
-  const profilePath = path.resolve('qwen_profile');
-  
-  context = await chromium.launchPersistentContext(profilePath, {
-    headless,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  });
-
-  // Keep an active page to fetch PoW headers on demand
-  activePage = await context.newPage();
-}
-
-export async function closePlaywright() {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) return;
-  if (context) {
-    await context.close();
-    context = null;
-    activePage = null;
-  }
-}
-
-export async function loginToQwen(email: string, password: string): Promise<boolean> {
-  if (!activePage) throw new Error('Playwright not initialized');
-
-  console.log(`[Playwright] Attempting API login for ${email}...`);
-  
-  // Navigate to auth page to set up context/cookies
-  await activePage.goto('https://chat.qwen.ai/auth', { waitUntil: 'networkidle' });
-
-  // Qwen expects SHA256 hashed password
-  const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
-
-  const result = await activePage.evaluate(async ({ email, password }) => {
-    try {
-      const response = await fetch("https://chat.qwen.ai/api/v2/auths/signin", {
-        method: "POST",
-        headers: {
-          "accept": "application/json, text/plain, */*",
-          "content-type": "application/json",
-          "source": "web",
-          "timezone": new Date().toString().split(' (')[0],
-          "x-request-id": crypto.randomUUID()
-        },
-        body: JSON.stringify({ email, password, login_type: "email" })
-      });
-      const data = await response.json();
-      return { ok: response.ok, data };
-    } catch (e: any) {
-      return { ok: false, error: e.message };
-    }
-  }, { email, password: hashedPassword });
-
-  if (result.ok) {
-    console.log('[Playwright] API login request successful.');
-    // Navigate to home to confirm session
-    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'networkidle' });
-    const isLogged = !(activePage.url().includes('auth') || activePage.url().includes('login'));
-    if (isLogged) {
-       console.log('[Playwright] Login confirmed.');
-       return true;
-    }
-  }
-
-  console.error('[Playwright] Login failed:', result.data || result.error);
-  return false;
-}
-
-/**
- * Ensures the session is valid and extracts headers, PoW, and session ID.
- */
-export async function getQwenHeaders(forceNew = false): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
-  // Use a lock to ensure only one request uses the UI at a time
-  const release = await new Promise<() => void>(resolve => {
-    uiLock = uiLock.then(() => new Promise<void>(innerResolve => {
-      resolve(innerResolve);
-    }));
-  });
-
-  try {
-    return await _getQwenHeadersInternal(forceNew);
-  } finally {
-    release();
-  }
-}
-
-async function _getQwenHeadersInternal(forceNew = false): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) {
-    const mockSessionId = process.env.TEST_SESSION_ID || 'mock-session';
-    return { 
-      headers: { 
-        'authorization': 'Bearer MOCK', 
-        'cookie': 'token=mock', 
-        'user-agent': 'mock',
-        'bx-v': '2.5.36'
-      }, 
-      chatSessionId: mockSessionId, 
-      parentMessageId: null 
-    };
-  }
-
-  if (!forceNew && cachedQwenHeaders && (Date.now() - lastHeadersTime < HEADERS_TTL)) {
-    return cachedQwenHeaders;
-  }
-
-  if (!activePage) {
-    throw new Error('Playwright not initialized');
-  }
-
-  const currentUrl = activePage.url();
-  const isOnQwen = currentUrl.includes('chat.qwen.ai');
-  const isOnSpecificChat = isOnQwen && /\/c\//.test(currentUrl);
-
-  // If we already have cookies and basic headers, and we are not forced to refresh,
-  // we can try to return what we have if it's recent enough.
-  // However, for completions we often need the latest PoW/bx headers.
-
-  if (!isOnQwen || forceNew || isOnSpecificChat) {
-    console.log(`[Playwright] Navigating to Qwen home... (Current: ${currentUrl})`);
-    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
-  }
-
-  // Check if we are on a login page or guest page and perform automated login
-  const isLoginPage = activePage.url().includes('login') || activePage.url().includes('auth') || activePage.url().includes('/c/guest') || (await activePage.$('input[type="email"], input[placeholder*="Email"]'));
-  if (isLoginPage) {
-    const email = process.env.QWEN_EMAIL;
-    const password = process.env.QWEN_PASSWORD;
-    
-    if (email && password) {
-      console.log('[Playwright] Detected login page. Attempting automated login...');
-      try {
-        // Wait for inputs
-        await activePage.waitForSelector('input[type="email"], input[placeholder*="Email"]', { timeout: 10000 });
-        await activePage.fill('input[type="email"], input[placeholder*="Email"]', email);
-        
-        // Sometimes password field only appears after clicking next or email entry
-        await activePage.keyboard.press('Enter');
-        await activePage.waitForTimeout(1000);
-        
-        await activePage.waitForSelector('input[type="password"]', { timeout: 10000 });
-        await activePage.fill('input[type="password"]', password);
-        await activePage.keyboard.press('Enter');
-        
-        // Wait for redirection back to chat
-        await activePage.waitForSelector('textarea:visible', { timeout: 30000 });
-        console.log('[Playwright] Automated login successful.');
-      } catch (err: any) {
-        console.error('[Playwright] Automated login failed:', err.message);
-      }
-    } else {
-      console.warn('[Playwright] Detected login page but QWEN_EMAIL/PASSWORD not provided in .env');
-    }
-  }
-
-  // Wait for the textarea
-  console.log('[Playwright] Waiting for chat input...');
-  const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
-  await activePage.waitForSelector(inputSelector, { timeout: 30000 }).catch(() => {
-    console.error('[Playwright] Chat input not found. Current URL:', activePage!.url());
-    throw new Error('Timeout waiting for chat input. Are you logged in?');
-  });
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      console.error('[Playwright] Timeout waiting for Qwen headers. Current URL:', activePage!.url());
-      reject(new Error('Timeout waiting for Qwen headers'));
-    }, 60000);
-
-    console.log('[Playwright] Setting up route interception...');
-    const routeHandler = async (route: any, request: any) => {
-      clearTimeout(timeout);
-      
-      const reqHeaders = request.headers();
-      let uiSessionId = '';
-      let uiParentMessageId: string | null = null;
-
-      const postData = request.postData();
-      if (postData) {
-        try {
-          const payload = JSON.parse(postData);
-          if (payload.chat_id) {
-            uiSessionId = payload.chat_id;
-          }
-          if (payload.parent_id !== undefined) {
-            uiParentMessageId = payload.parent_id;
-          }
-        } catch (e) {
-          // ignore parsing error
-        }
-      }
-
-      const extractedHeaders = {
-        'cookie': reqHeaders['cookie'] || '',
-        'bx-ua': reqHeaders['bx-ua'] || '',
-        'bx-umidtoken': reqHeaders['bx-umidtoken'] || '',
-        'bx-v': reqHeaders['bx-v'] || '',
-        'x-request-id': reqHeaders['x-request-id'] || '',
-        'user-agent': reqHeaders['user-agent'] || ''
-      };
-
-      // Ensure we have at least cookies and bx-ua (which are critical)
-      if (!extractedHeaders.cookie || !extractedHeaders['bx-ua']) {
-        console.log('[Playwright] Intercepted request missing critical headers, skipping...');
-        await route.continue();
-        return;
-      }
-
-      console.log('[Playwright] Successfully intercepted headers.');
-      currentHeaders = extractedHeaders;
-      cachedQwenHeaders = { headers: extractedHeaders, chatSessionId: uiSessionId, parentMessageId: uiParentMessageId };
-      lastHeadersTime = Date.now();
-
-      // Trigger native tools disabling on first header interception
-      import('./qwen.ts').then(m => m.disableNativeTools().catch(() => {}));
-
-      // Abort to prevent polluting chat history
-      await route.abort('aborted');
-      
-      // Cleanup route
-      await activePage!.unroute('**/api/v2/chat/completions*', routeHandler);
-
-      resolve(cachedQwenHeaders);
-    };
-
-    activePage!.route('**/api/v2/chat/completions*', routeHandler).then(async () => {
-      console.log('[Playwright] Triggering request...');
-      const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
-      
-      // We use type instead of fill to trigger all events
-      await activePage!.focus(inputSelector);
-      await activePage!.fill(inputSelector, ''); // clear first
-      await activePage!.type(inputSelector, 'a', { delay: 100 });
-      console.log('[Playwright] Typed char, waiting for UI to update...');
-      await activePage!.waitForTimeout(2000); // Wait more for Send button to enable
-      
-      // Improved Send Button detection & aggressive clicking
-      const selectors = [
-        '.message-input-right-button-send .send-button',
-        '.chat-prompt-send-button',
-        'button.send-button'
-      ];
-      
-      let clicked = false;
-      for (const selector of selectors) {
-        try {
-          const btn = await activePage!.$(selector);
-          if (btn && await btn.isVisible()) {
-            console.log(`[Playwright] Attempting click on: ${selector}`);
-            
-            // Try both DOM click and Playwright click
-            await activePage!.evaluate((sel) => {
-              const element = document.querySelector(sel) as HTMLElement;
-              if (element) {
-                element.focus();
-                element.click();
-              }
-            }, selector);
-            
-            // Also try a real mouse click just in case
-            await btn.click({ force: true, delay: 50 }).catch(() => {});
-            
-            clicked = true;
-            break;
-          }
-        } catch (e) {
-          console.error(`[Playwright] Error clicking ${selector}:`, e);
-        }
-      }
-
-      if (!clicked) {
-        console.log('[Playwright] No send button found/clicked, fallback to Enter...');
-        await activePage!.focus(inputSelector);
-        await activePage!.keyboard.press('Enter');
-      }
+export async function initPlaywright() {
+  if (!browser) {
+    console.log('[Playwright] Launching browser...');
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled'
+      ]
     });
-  });
+    console.log('[Playwright] Browser launched.');
+  }
 }
+
+// ✅ Criar nova sessão do Qwen
+async function createNewSession(): Promise<QwenSession> {
+  if (!browser) await initPlaywright();
+
+  console.log('[Playwright] Creating new Qwen session...');
+
+  const context = await browser!.newContext({
+    viewport: { width: 1280, height: 720 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  });
+
+  const page = await context.newPage();
+
+  // Navegar para Qwen
+  console.log('[Playwright] Navigating to Qwen...');
+  await page.goto('https://chat.qwen.ai', { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(2000);
+
+  // Aguardar input estar pronto
+  await page.waitForSelector('.message-input-area textarea, input[placeholder*="Message"]', { timeout: 10000 });
+
+  // ✅ Disparar uma mensagem dummy para criar chat e capturar headers
+  let headers: Record<string, string> = {};
+  let chatSessionId = '';
+
+  const interceptPromise = page.waitForResponse(
+    (response) => response.url().includes('/api/v2/chat/completions'),
+    { timeout: 15000 }
+  ).then(async (response) => {
+    const reqHeaders = response.request().headers();
+    headers = {
+      'cookie': reqHeaders['cookie'] || '',
+      'user-agent': reqHeaders['user-agent'] || '',
+      'bx-v': reqHeaders['bx-v'] || '',
+      'bx-ua': reqHeaders['bx-ua'] || '',
+      'bx-umidtoken': reqHeaders['bx-umidtoken'] || ''
+    };
+
+    // Extrair chat_id da URL
+    const url = response.url();
+    const match = url.match(/chat_id=([^&]+)/);
+    if (match) chatSessionId = match[1];
+  });
+
+  // Disparar mensagem
+  const inputSelector = '.message-input-area textarea, input[placeholder*="Message"]';
+  await page.fill(inputSelector, '.');
+  await page.waitForTimeout(500);
+  await page.keyboard.press('Enter');
+
+  await interceptPromise;
+
+  console.log(`[Playwright] ✅ New session created | chat_id: ${chatSessionId}`);
+
+  return {
+    context,
+    page,
+    chatSessionId,
+    requestCount: 0,
+    createdAt: Date.now()
+  };
+}
+
+// ✅ Obter sessão disponível (ou criar nova)
+async function getAvailableSession(): Promise<QwenSession> {
+  // Limpar sessões expiradas (>30min sem uso)
+  const now = Date.now();
+  for (let i = sessionPool.length - 1; i >= 0; i--) {
+    const session = sessionPool[i];
+    if (now - session.createdAt > 30 * 60 * 1000) {
+      console.log(`[Playwright] Closing expired session: ${session.chatSessionId}`);
+      await session.context.close();
+      sessionPool.splice(i, 1);
+    }
+  }
+
+  // Procurar sessão disponível (abaixo do limite)
+  for (const session of sessionPool) {
+    if (session.requestCount < MAX_REQUESTS_PER_SESSION) {
+      console.log(`[Playlist] Reusing session ${session.chatSessionId} (${session.requestCount}/${MAX_REQUESTS_PER_SESSION} requests)`);
+      return session;
+    }
+  }
+
+  // Se todas estão no limite, limpar a mais antiga e criar nova
+  if (sessionPool.length >= MAX_SESSIONS) {
+    const oldest = sessionPool.shift()!;
+    console.log(`[Playwright] Pool full, closing oldest session: ${oldest.chatSessionId}`);
+    await oldest.context.close();
+  }
+
+  // Criar nova sessão
+  const newSession = await createNewSession();
+  sessionPool.push(newSession);
+  return newSession;
+}
+
+// ✅ Função principal: obter headers de uma sessão válida
+export async function getQwenHeaders(forceNew = false): Promise<{
+  headers: Record<string, string>;
+  chatSessionId: string;
+  parentMessageId: string | null;
+}> {
+  let session: QwenSession;
+
+  if (forceNew) {
+    // Forçar nova sessão
+    console.log('[Playwright] Force new session requested');
+    session = await createNewSession();
+    sessionPool.push(session);
+  } else {
+    // Obter sessão disponível
+    session = await getAvailableSession();
+  }
+
+  // ✅ Incrementar contador de uso
+  session.requestCount++;
+
+  // Re-extrair headers atualizados
+  const page = session.page;
+  
+  let headers: Record<string, string> = {};
+  let parentMessageId: string | null = null;
+
+  // Interceptar próxima request para pegar headers frescos
+  const interceptPromise = page.waitForResponse(
+    (response) => response.url().includes('/api/v2/chat/completions'),
+    { timeout: 10000 }
+  ).then(async (response) => {
+    const reqHeaders = response.request().headers();
+    headers = {
+      'cookie': reqHeaders['cookie'] || '',
+      'user-agent': reqHeaders['user-agent'] || '',
+      'bx-v': reqHeaders['bx-v'] || '',
+      'bx-ua': reqHeaders['bx-ua'] || '',
+      'bx-umidtoken': reqHeaders['bx-umidtoken'] || ''
+    };
+  }).catch(() => {
+    // Se timeout, usar headers em cache (melhor que falhar)
+    console.warn('[Playwright] Could not refresh headers, using cached');
+  });
+
+  // Disparar mensagem dummy para refresh de headers
+  const inputSelector = '.message-input-area textarea, input[placeholder*="Message"]';
+  await page.fill(inputSelector, '.');
+  await page.waitForTimeout(300);
+  await page.keyboard.press('Enter');
+
+  await interceptPromise.catch(() => {});
+
+  console.log(`[Playwright] Session ${session.chatSessionId} | Requests: ${session.requestCount}/${MAX_REQUESTS_PER_SESSION}`);
+
+  return {
+    headers,
+    chatSessionId: session.chatSessionId,
+    parentMessageId
+  };
+}
+
+// ✅ Obter headers básicos (sem criar sessão completa)
+export async function getBasicHeaders(): Promise<{
+  cookie: string;
+  userAgent: string;
+  bxV: string;
+}> {
+  const session = await getAvailableSession();
+  const cookies = await session.context.cookies();
+  const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+  return {
+    cookie: cookieString,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    bxV: '2.5.4'
+  };
+}
+
+// ✅ Cleanup ao encerrar
+export async function closePlaywright() {
+  console.log('[Playwright] Closing all sessions...');
+  for (const session of sessionPool) {
+    await session.context.close();
+  }
+  sessionPool.length = 0;
+
+  if (browser) {
+    await browser.close();
+    browser = null;
+    console.log('[Playwright] Browser closed.');
+  }
+}
+
+process.on('SIGINT', async () => {
+  await closePlaywright();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await closePlaywright();
+  process.exit(0);
+});
